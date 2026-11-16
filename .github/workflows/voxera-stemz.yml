@@ -1,0 +1,205 @@
+name: Voxera Stemz
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun simctl list devices available
+
+      - name: XcodeGen
+        working-directory: VoxeraStemz
+        run: |
+          set -euo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_NO_INSTALL_CLEANUP=1
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Pick an iPhone simulator
+        id: sim
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+          raw = subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"], text=True)
+          data = json.loads(raw)
+          found = []
+          for runtime, devices in data.get("devices", {}).items():
+              if "iOS" not in runtime:
+                  continue
+              version = []
+              chunk = ""
+              for ch in runtime:
+                  if ch.isdigit():
+                      chunk += ch
+                  elif chunk:
+                      version.append(int(chunk))
+                      chunk = ""
+              if chunk:
+                  version.append(int(chunk))
+              for device in devices:
+                  if device.get("isAvailable") is False:
+                      continue
+                  name = device.get("name") or ""
+                  udid = device.get("udid") or ""
+                  if "iPhone" not in name or not udid:
+                      continue
+                  found.append((version, name, udid, runtime))
+          if not found:
+              sys.stderr.write(raw)
+              sys.exit("No available iPhone simulator")
+          found.sort()
+          version, name, udid, runtime = found[-1]
+          print(f"Using {name} ({udid}) on {runtime}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"udid={udid}\n")
+              fh.write(f"name={name}\n")
+          PY
+
+      - name: Tests
+        working-directory: VoxeraStemz
+        run: |
+          set -euo pipefail
+          UDID="${{ steps.sim.outputs.udid }}"
+          echo "Booting ${{ steps.sim.outputs.name }} ($UDID)"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          rm -rf "$GITHUB_WORKSPACE/TestResults.xcresult"
+          xcodebuild test \
+            -project VoxeraStemz.xcodeproj \
+            -scheme VoxeraStemz \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -resultBundlePath "$GITHUB_WORKSPACE/TestResults.xcresult" \
+            -derivedDataPath "$GITHUB_WORKSPACE/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=- \
+            DEVELOPMENT_TEAM=
+
+      - name: Unsigned device IPA
+        working-directory: VoxeraStemz
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/build/device" "$GITHUB_WORKSPACE/Payload" "$GITHUB_WORKSPACE/VoxeraStemz-1.1-unsigned.ipa"
+          xcodebuild \
+            -project VoxeraStemz.xcodeproj \
+            -scheme VoxeraStemz \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$GITHUB_WORKSPACE/build/device" \
+            build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=- \
+            DEVELOPMENT_TEAM=
+          APP="$(find "$GITHUB_WORKSPACE/build/device/Build/Products" -type d -name 'VoxeraStemz.app' -print -quit)"
+          test -n "$APP"
+          test -x "$APP/VoxeraStemz"
+          test -e "$APP/Assets.car"
+          mkdir -p "$GITHUB_WORKSPACE/Payload"
+          cp -R "$APP" "$GITHUB_WORKSPACE/Payload/VoxeraStemz.app"
+          rm -rf "$GITHUB_WORKSPACE/Payload/VoxeraStemz.app/_CodeSignature"
+          (
+            cd "$GITHUB_WORKSPACE"
+            zip -r -X -y VoxeraStemz-1.1-unsigned.ipa Payload >/dev/null
+          )
+          python3 - <<'PY'
+          import os
+          import plistlib
+          import zipfile
+          path = os.path.join(os.environ["GITHUB_WORKSPACE"], "VoxeraStemz-1.1-unsigned.ipa")
+          with zipfile.ZipFile(path) as zf:
+              names = zf.namelist()
+              assert "Payload/VoxeraStemz.app/Info.plist" in names
+              assert "Payload/VoxeraStemz.app/VoxeraStemz" in names
+              assert "Payload/VoxeraStemz.app/Assets.car" in names
+              info = plistlib.loads(zf.read("Payload/VoxeraStemz.app/Info.plist"))
+          assert info["CFBundleIdentifier"] == "com.alex.voxerastemz"
+          assert info["CFBundleShortVersionString"] == "1.1"
+          assert str(info["CFBundleVersion"]) == "2"
+          assert info["CFBundleExecutable"] == "VoxeraStemz"
+          assert info["CFBundleDisplayName"] == "Voxera Stemz"
+          print("ipa ok", info["CFBundleShortVersionString"], info["CFBundleVersion"])
+          PY
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoxeraStemz-1.1-unsigned.ipa
+          path: VoxeraStemz-1.1-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Collect crash logs
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, shutil, time
+          from pathlib import Path
+          roots = [
+              Path.home() / "Library/Logs/DiagnosticReports",
+              Path.home() / "Library/Developer/CoreSimulator/Devices",
+              Path(os.environ["GITHUB_WORKSPACE"]) / "DerivedData",
+          ]
+          out = Path(os.environ["GITHUB_WORKSPACE"]) / "ci-logs"
+          if out.exists():
+              shutil.rmtree(out)
+          out.mkdir()
+          now = time.time()
+          copied = 0
+          for root in roots:
+              if not root.exists():
+                  continue
+              for path in root.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  interesting = path.suffix in {".crash", ".ips"} or path.name == "ultimo-error.txt"
+                  if not interesting:
+                      continue
+                  try:
+                      age = now - path.stat().st_mtime
+                  except OSError:
+                      continue
+                  if age > 6 * 3600:
+                      continue
+                  dest = out / f"{copied:03d}-{path.name}"
+                  try:
+                      shutil.copy2(path, dest)
+                  except OSError:
+                      continue
+                  copied += 1
+          print(f"copied {copied} crash or error logs")
+          PY
+
+      - name: Upload xcresult
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoxeraStemz-xcresult
+          path: TestResults.xcresult
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload crash logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoxeraStemz-crash-logs
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 14
